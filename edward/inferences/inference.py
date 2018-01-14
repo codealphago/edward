@@ -30,16 +30,18 @@ of adding to global collections and TF graph). It forgoes OO.
 This file is a collection of functions shared across inference
 algorithms, used for the following:
 
-+ input checking and default constructors
-+ programmatic docstrings
++ (TODO move elsewhere?) call f up to args
++ a "make intercept" factory
 + automated transforms
-+ summaries
-+ variable scoping
++ programmatic docstrings
 + train()
-+ for a subset of algs, optimizer and Monte Carlo stuff (TBA).
 
 Other files provide functions to help produce the train (and
 post-training) ops.
+
+We do no input checking and assume the idiom of duck typing. (Although
+sometimes because TensorFlow is statically typed, we check input
+types. But we typically try to defer to Python.)
 """
 from __future__ import absolute_import
 from __future__ import division
@@ -52,244 +54,72 @@ import os
 
 from datetime import datetime
 from edward.models import RandomVariable
-from edward.util import get_session, get_variables, Progbar
+from edward.util import get_variables, Progbar
 from edward.util import transform as _transform
 
-from tensorflow.contrib.distributions import bijectors
+tfb = tf.contrib.distributions.bijectors
 
 
-def check_and_maybe_build_data(data):
-  """Check that the data dictionary passed during inference and
-  criticism is valid.
-
-  Args:
-    data: dict.
-      Data dictionary which binds observed variables (of type
-      `RandomVariable` or `tf.Tensor`) to their realizations (of
-      type `tf.Tensor`). It can also bind placeholders (of type
-      `tf.Tensor`) used in the model to their realizations; and
-      prior latent variables (of type `RandomVariable`) to posterior
-      latent variables (of type `RandomVariable`).
-  """
-  sess = get_session()
-  if data is None:
-    data = {}
-  elif not isinstance(data, dict):
-    raise TypeError("data must have type dict.")
-
-  for key, value in six.iteritems(data):
-    if isinstance(key, tf.Tensor) and "Placeholder" in key.op.type:
-      if isinstance(value, RandomVariable):
-        raise TypeError("The value of a feed cannot be a ed.RandomVariable "
-                        "object. "
-                        "Acceptable feed values include Python scalars, "
-                        "strings, lists, numpy ndarrays, or TensorHandles.")
-      elif isinstance(value, tf.Tensor):
-        raise TypeError("The value of a feed cannot be a tf.Tensor object. "
-                        "Acceptable feed values include Python scalars, "
-                        "strings, lists, numpy ndarrays, or TensorHandles.")
-    elif isinstance(key, (RandomVariable, tf.Tensor)):
-      if isinstance(value, (RandomVariable, tf.Tensor)):
-        if not key.shape.is_compatible_with(value.shape):
-          raise TypeError("Key-value pair in data does not have same "
-                          "shape: {}, {}".format(key.shape, value.shape))
-        elif key.dtype != value.dtype:
-          raise TypeError("Key-value pair in data does not have same "
-                          "dtype: {}, {}".format(key.dtype, value.dtype))
-      elif isinstance(value, (float, list, int, np.ndarray, np.number, str)):
-        if not key.shape.is_compatible_with(np.shape(value)):
-          raise TypeError("Key-value pair in data does not have same "
-                          "shape: {}, {}".format(key.shape, np.shape(value)))
-        elif isinstance(value, (np.ndarray, np.number)) and \
-                not np.issubdtype(value.dtype, np.float) and \
-                not np.issubdtype(value.dtype, np.int) and \
-                not np.issubdtype(value.dtype, np.str):
-          raise TypeError("Data value has an invalid dtype: "
-                          "{}".format(value.dtype))
-      else:
-        raise TypeError("Data value has an invalid type: "
-                        "{}".format(type(value)))
-    else:
-      raise TypeError("Data key has an invalid type: {}".format(type(key)))
-
-  processed_data = {}
-  for key, value in six.iteritems(data):
-    if isinstance(key, tf.Tensor) and "Placeholder" in key.op.type:
-      processed_data[key] = value
-    elif isinstance(key, (RandomVariable, tf.Tensor)):
-      if isinstance(value, (RandomVariable, tf.Tensor)):
-        processed_data[key] = value
-      elif isinstance(value, (float, list, int, np.ndarray, np.number, str)):
-        # If value is a Python type, store it in the graph.
-        # Assign its placeholder with the key's data type.
-        with tf.variable_scope(None, default_name="data"):
-          ph = tf.placeholder(key.dtype, np.shape(value))
-          var = tf.Variable(ph, trainable=False, collections=[])
-          sess.run(var.initializer, {ph: value})
-          processed_data[key] = var
-  return processed_data
-
-
-def check_and_maybe_build_latent_vars(latent_vars):
-  """Check that the latent variable dictionary passed during inference and
-  criticism is valid.
-
-  Args:
-    latent_vars: dict.
-      Collection of latent variables (of type `RandomVariable` or
-      `tf.Tensor`) to perform inference on. Each random variable is
-      binded to another random variable; the latter will infer the
-      former conditional on data.
-  """
-  if latent_vars is None:
-    latent_vars = {}
-  elif not isinstance(latent_vars, dict):
-    raise TypeError("latent_vars must have type dict.")
-
-  for key, value in six.iteritems(latent_vars):
-    if not isinstance(key, (RandomVariable, tf.Tensor)):
-      raise TypeError("Latent variable key has an invalid type: "
-                      "{}".format(type(key)))
-    elif not isinstance(value, (RandomVariable, tf.Tensor)):
-      raise TypeError("Latent variable value has an invalid type: "
-                      "{}".format(type(value)))
-    elif not key.shape.is_compatible_with(value.shape):
-      raise TypeError("Key-value pair in latent_vars does not have same "
-                      "shape: {}, {}".format(key.shape, value.shape))
-    elif key.dtype != value.dtype:
-      raise TypeError("Key-value pair in latent_vars does not have same "
-                      "dtype: {}, {}".format(key.dtype, value.dtype))
-  return latent_vars
-
-
-def check_and_maybe_build_dict(x):
-  if x is None:
-    x = {}
-  elif not isinstance(x, dict):
-    raise TypeError("x must be dict; got {}".format(type(x).__name__))
-  return x
-
-
-def check_and_maybe_build_var_list(var_list, latent_vars, data):
-  """
-  Returns:
-    List of TensorFlow variables to optimize over. Default is all
-    trainable variables that `latent_vars` and `data` depend on,
-    excluding those that are only used in conditionals in `data`.
-  """
-  # Traverse random variable graphs to get default list of variables.
-  if var_list is None:
-    var_list = set()
-    trainables = tf.trainable_variables()
-    for z, qz in six.iteritems(latent_vars):
-      var_list.update(get_variables(z, collection=trainables))
-      var_list.update(get_variables(qz, collection=trainables))
-
-    for x, qx in six.iteritems(data):
-      if isinstance(x, RandomVariable) and \
-              not isinstance(qx, RandomVariable):
-        var_list.update(get_variables(x, collection=trainables))
-
-    var_list = list(var_list)
-  return var_list
-
-
-def transform(latent_vars, auto_transform=True):
-  """
-  Args:
-    auto_transform: bool, optional.
-      Whether to automatically transform continuous latent variables
-      of unequal support to be on the unconstrained space. It is
-      only applied if the argument is `True`, the latent variable
-      pair are `ed.RandomVariable`s with the `support` attribute,
-      the supports are both continuous and unequal.
-  """
-  # map from original latent vars to unconstrained versions
-  if auto_transform:
-    latent_vars_temp = latent_vars.copy()
-    # latent_vars maps original latent vars to constrained Q's.
-    # latent_vars_unconstrained maps unconstrained vars to unconstrained Q's.
-    latent_vars = {}
-    latent_vars_unconstrained = {}
-    for z, qz in six.iteritems(latent_vars_temp):
-      if hasattr(z, 'support') and hasattr(qz, 'support') and \
-            z.support != qz.support and qz.support != 'point':
-
-        # transform z to an unconstrained space
-        z_unconstrained = _transform(z)
-
-        # make sure we also have a qz that covers the unconstrained space
-        if qz.support == "points":
-          qz_unconstrained = qz
-        else:
-          qz_unconstrained = _transform(qz)
-        latent_vars_unconstrained[z_unconstrained] = qz_unconstrained
-
-        # additionally construct the transformation of qz
-        # back into the original constrained space
-        if z_unconstrained != z:
-          qz_constrained = _transform(
-            qz_unconstrained, bijectors.Invert(z_unconstrained.bijector))
-
-          try: # attempt to pushforward the params of Empirical distributions
-            qz_constrained.params = z_unconstrained.bijector.inverse(
-              qz_unconstrained.params)
-          except: # qz_unconstrained is not an Empirical distribution
-            pass
-
-        else:
-          qz_constrained = qz_unconstrained
-
-        latent_vars[z] = qz_constrained
-      else:
-        latent_vars[z] = qz
-        latent_vars_unconstrained[z] = qz
+def call_function_up_to_args(f, *args, **kwargs):
+  import inspect
+  if hasattr(f, "_func"):  # make_template()
+    argspec = inspect.getargspec(f._func)
   else:
-    latent_vars_unconstrained = None
-  return latent_vars, latent_vars_unconstrained
+    argspec = inspect.getargspec(f)
+  num_kwargs = len(argspec.defaults) if argspec.defaults is not None else 0
+  num_args = len(argspec.args) - num_kwargs
+  if num_args > 0:
+    return f(args[:num_args], **kwargs)
+  elif num_kwargs > 0:
+    return f(**kwargs)
+  return f()
 
 
-def summary_variables(latent_vars=None, data=None, variables=None,
-                      *args, **kwargs):
-  # Note: to use summary_key, set
-  # collections=[tf.get_default_graph().unique_name("summaries")]
-  # TODO include in TensorBoard tutorial
-  """Log variables to TensorBoard.
-
-  For each variable in `variables`, forms a `tf.summary.scalar` if
-  the variable has scalar shape; otherwise forms a `tf.summary.histogram`.
-
-  Args:
-    variables: list, optional.
-      Specifies the list of variables to log after each `n_print`
-      steps. If None, will log all variables. If `[]`, no variables
-      will be logged.
-  """
-  if variables is None:
-    variables = []
-    for key in six.iterkeys(data):
-      variables += get_variables(key)
-
-    for key, value in six.iteritems(latent_vars):
-      variables += get_variables(key)
-      variables += get_variables(value)
-
-    variables = set(variables)
-
-  for var in variables:
-    # replace colons which are an invalid character
-    var_name = var.name.replace(':', '/')
-    # Log all scalars.
-    if len(var.shape) == 0:
-      tf.summary.scalar("parameter/{}".format(var_name),
-                        var, *args, **kwargs)
-    elif len(var.shape) == 1 and var.shape[0] == 1:
-      tf.summary.scalar("parameter/{}".format(var_name),
-                        var[0], *args, **kwargs)
+def make_intercept(trace, align_data, align_latent, args, kwargs):
+  def _intercept(f, *fargs, **fkwargs):
+    """Set model's sample values to variational distribution's and data."""
+    name = fkwargs.get('name', None)
+    key = align_data(name)
+    if isinstance(key, int):
+      fkwargs['value'] = args[key]
+    elif kwargs.get(key, None) is not None:
+      fkwargs['value'] = kwargs.get(key)
     else:
-      # If var is multi-dimensional, log a histogram of its values.
-      tf.summary.histogram("parameter/{}".format(var_name),
-                           var, *args, **kwargs)
+      qz = trace[align_latent(name)].value
+      fkwargs['value'] = qz.value
+    # if auto_transform and 'qz' in locals():
+    #   # TODO for generation to work, must output original dist. to
+    #   keep around TD? must maintain another stack to write to as a
+    #   side-effect (or augment the original stack).
+    #   return transform(f, qz, *fargs, **fkwargs)
+    return f(*fargs, **fkwargs)
+  return _intercept
+
+
+def transform(f, qz, *args, **kwargs):
+  """Transform prior -> unconstrained -> q's constraint.
+
+  When using in VI, we keep variational distribution on its original
+  space (for sake of implementing only one intercepting function).
+  """
+  # TODO deal with f or qz being 'point' or 'points'
+  if (not hasattr(f, 'support') or not hasattr(qz, 'support') or
+      f.support == qz.support):
+    return f(*args, **kwargs)
+  value = kwargs.pop('value')
+  kwargs['value'] = 0.0  # to avoid sampling; TODO follow sample shape
+  rv = f(*args, **kwargs)
+  # Take shortcuts in logic if p or q are already unconstrained.
+  if qz.support in ('real', 'multivariate_real'):
+    return _transform(rv, value=value)
+  if rv.support in ('real', 'multivariate_real'):
+    rv_unconstrained = rv
+  else:
+    rv_unconstrained = _transform(rv, value=0.0)
+  unconstrained_to_constrained = tfb.Invert(_transform(qz).bijector)
+  return _transform(rv_unconstrained,
+                    unconstrained_to_constrained,
+                    value=value)
 
 
 def train(train_op, summary_key=None, n_iter=1000, n_print=None,
@@ -351,7 +181,7 @@ def train(train_op, summary_key=None, n_iter=1000, n_print=None,
 
   if summary_key is not None:
     # TODO should run() also add summaries; or should user call
-    # summary_variables() manually?
+    # _summary_variables() manually?
     summarize = tf.summary.merge_all(key=summary_key)
     if log_timestamp:
       logdir = os.path.expanduser(logdir)
@@ -382,7 +212,7 @@ def train(train_op, summary_key=None, n_iter=1000, n_print=None,
     threads = tf.train.start_queue_runners(coord=coord)
 
   for _ in range(n_iter):
-    info_dict = update(progbar, n_print, summarize,
+    info_dict = _update(progbar, n_print, summarize,
                        train_writer, debug, op_check,
                        train_op, *args, **kwargs)
 
@@ -400,8 +230,52 @@ def train(train_op, summary_key=None, n_iter=1000, n_print=None,
     coord.request_stop()
     coord.join(threads)
 
-def optimize(loss, grads_and_vars, collections=None, var_list=None,
-             optimizer=None, use_prettytensor=False, global_step=None):
+
+def _summary_variables(latent_vars=None, data=None, variables=None,
+                      *args, **kwargs):
+  # Note: to use summary_key, set
+  # collections=[tf.get_default_graph().unique_name("summaries")]
+  # TODO include in TensorBoard tutorial
+  """Log variables to TensorBoard.
+
+  For each variable in `variables`, forms a `tf.summary.scalar` if
+  the variable has scalar shape; otherwise forms a `tf.summary.histogram`.
+
+  Args:
+    variables: list, optional.
+      Specifies the list of variables to log after each `n_print`
+      steps. If None, will log all variables. If `[]`, no variables
+      will be logged.
+  """
+  if variables is None:
+    variables = []
+    for key in six.iterkeys(data):
+      variables += get_variables(key)
+
+    for key, value in six.iteritems(latent_vars):
+      variables += get_variables(key)
+      variables += get_variables(value)
+
+    variables = set(variables)
+
+  for var in variables:
+    # replace colons which are an invalid character
+    var_name = var.name.replace(':', '/')
+    # Log all scalars.
+    if len(var.shape) == 0:
+      tf.summary.scalar("parameter/{}".format(var_name),
+                        var, *args, **kwargs)
+    elif len(var.shape) == 1 and var.shape[0] == 1:
+      tf.summary.scalar("parameter/{}".format(var_name),
+                        var[0], *args, **kwargs)
+    else:
+      # If var is multi-dimensional, log a histogram of its values.
+      tf.summary.histogram("parameter/{}".format(var_name),
+                           var, *args, **kwargs)
+
+
+def _optimize(loss, grads_and_vars, collections=None, var_list=None,
+              optimizer=None, use_prettytensor=False, global_step=None):
   """Build optimizer and its train op applied to loss or
   grads_and_vars.
 
@@ -481,8 +355,8 @@ def optimize(loss, grads_and_vars, collections=None, var_list=None,
   return train_op
 
 
-def update(progbar, n_print, summarize=None, train_writer=None,
-           debug=False, op_check=None, *args, **kwargs):
+def _update(progbar, n_print, summarize=None, train_writer=None,
+            debug=False, op_check=None, *args, **kwargs):
   """Run one iteration of optimization.
 
   Args:
@@ -529,8 +403,8 @@ def update(progbar, n_print, summarize=None, train_writer=None,
 
 # TODO within run(), use this for gan_inference, wgan_inference,
 # implicit_klqp, bigan_inference
-def update(train_op, train_op_d, n_print, summarize=None, train_writer=None,
-           debug=False, op_check=None, variables=None, *args, **kwargs):
+def _update(train_op, train_op_d, n_print, summarize=None, train_writer=None,
+            debug=False, op_check=None, variables=None, *args, **kwargs):
   """Run one iteration of optimization.
 
   Args:
@@ -581,8 +455,8 @@ def update(train_op, train_op_d, n_print, summarize=None, train_writer=None,
   return dict(zip(kwargs_temp.keys(), values))
 
 # TODO within run(), use this for wgan_inference
-def update(clip_op, variables=None, *args, **kwargs):
-  info_dict = gan_inference.update(variables=variables, *args, **kwargs)
+def _update(clip_op, variables=None, *args, **kwargs):
+  info_dict = gan_inference._update(variables=variables, *args, **kwargs)
 
   sess = get_session()
   if clip_op is not None and variables in (None, "Disc"):
